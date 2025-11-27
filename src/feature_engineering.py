@@ -475,33 +475,41 @@ class EagleFordFeatureEngineer:
         features_added = 0
         
         try:
-            # Identify available log curves (exclude metadata columns)
-            exclude_cols = ['DEPTH', 'well_api', 'well_name', 'operator', 'filename', 'sequence_position', 
-                          'sequence_position_norm', 'depth_normalized', 'depth_scaled', 
-                          'depth_from_top', 'depth_from_bottom', 'in_eagle_ford_window']
+            # CRITICAL FIX: Only use core log curves to prevent feature explosion
+            # Identify ONLY core log curves for cross-curve features
+            core_curves = []
+            for col in df_features.columns:
+                # Only include basic log curves, not derived features
+                if col in ['GR', 'RHOB', 'NPHI', 'RT', 'PE', 'CALI', 'SP', 'ROP', 'TVD', 'VS']:
+                    core_curves.append(col)
             
-            log_curves = [col for col in df_features.columns if col not in exclude_cols and not col.startswith('gr_')]
-            log_curves = [col for col in log_curves if not any(suffix in col for suffix in ['_roll_', '_gradient', '_diff_', '_pct_change', '_curvature', 'is_'])]
+            # Limit to maximum 6 curves to prevent explosion (6 choose 2 = 15 pairs max)
+            core_curves = core_curves[:6]
             
-            if len(log_curves) < 2:
-                self.logger.debug("Insufficient curves for cross-curve features")
+            if len(core_curves) < 2:
+                self.logger.debug("Insufficient core curves for cross-curve features")
                 return df_features
                 
-            # Create ratios and differences
-            for i, curve1 in enumerate(log_curves):
-                for curve2 in log_curves[i+1:]:
+            self.logger.debug(f"Using {len(core_curves)} core curves for cross-curve features: {core_curves}")
+            
+            # Create ONLY ratios (most important) - NO diffs or products
+            max_cross_features = 20  # Hard limit to prevent explosion
+            features_created = 0
+            
+            for i, curve1 in enumerate(core_curves):
+                for curve2 in core_curves[i+1:]:
+                    if features_created >= max_cross_features:
+                        self.logger.warning(f"Hit max cross-curve feature limit ({max_cross_features})")
+                        break
+                        
                     if curve1 in df_features.columns and curve2 in df_features.columns:
-                        
-                        # Ratio features (avoid division by zero)
+                        # ONLY ratio features (most predictive)
                         df_features[f'{curve1}_{curve2}_ratio'] = df_features[curve1] / (df_features[curve2] + 1e-8)
+                        features_added += 1
+                        features_created += 1
                         
-                        # Difference features
-                        df_features[f'{curve1}_{curve2}_diff'] = df_features[curve1] - df_features[curve2]
-                        
-                        # Product features
-                        df_features[f'{curve1}_{curve2}_product'] = df_features[curve1] * df_features[curve2]
-                        
-                        features_added += 3
+                if features_created >= max_cross_features:
+                    break
                         
             # Common petrophysical relationships (if curves available)
             if 'GR' in df_features.columns and 'RHOB' in df_features.columns:
@@ -571,18 +579,32 @@ class EagleFordFeatureEngineer:
                     # Depth for reference
                     depth = df.iloc[i]['DEPTH']
                     
-                    # Skip if any NaN values
+                    # Skip if any NaN values - FIXED for mixed data types
                     try:
-                        # Check for NaN in sequence data and target
-                        seq_has_nan = np.isnan(seq_data).any() if seq_data.size > 0 else True
-                        target_has_nan = np.isnan(target) if np.isscalar(target) else np.isnan(target).any()
+                        # Robust NaN checking that handles mixed data types
+                        seq_has_nan = False
+                        if seq_data.size > 0:
+                            try:
+                                # Try numeric NaN check first
+                                seq_has_nan = np.isnan(seq_data.astype(float)).any()
+                            except (ValueError, TypeError):
+                                # If conversion fails, check for None or string 'nan'
+                                seq_has_nan = pd.isna(seq_data).any()
+                        
+                        target_has_nan = False
+                        try:
+                            # Try numeric NaN check for target
+                            target_has_nan = np.isnan(float(target))
+                        except (ValueError, TypeError):
+                            # Fallback to pandas isna for mixed types
+                            target_has_nan = pd.isna(target)
                         
                         if not (seq_has_nan or target_has_nan):
                             sequences.append(seq_data)
                             targets.append(target)
                             depths.append(depth)
                     except Exception as seq_error:
-                        self.logger.debug(f"Skipping sequence at index {i} due to NaN check error: {seq_error}")
+                        self.logger.debug(f"Skipping sequence at index {i} due to data validation error: {seq_error}")
                         continue
                         
                 except Exception as loop_error:
@@ -1091,9 +1113,10 @@ class EagleFordFeatureEngineer:
                 
             self.logger.info("✅ Created normalized datasets with memory optimization")
             
-            # Create sequence data for LSTM
-            if self.config.get('sequence_features'):
-                self.save_sequence_data(feature_df)
+            # Create sequence data for LSTM - SKIP for memory conservation
+            if self.config.get('sequence_features') and len(feature_df) < 100000:  # Only for small datasets
+                self.logger.warning("⚠️  Skipping LSTM sequences to prevent OOM - dataset too large")
+                # self.save_sequence_data(feature_df)  # Disabled to prevent memory explosion
                 
             # Feature summary report
             feature_summary = {

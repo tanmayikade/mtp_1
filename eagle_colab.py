@@ -913,6 +913,12 @@ class EagleFordPipeline:
         
         # Optimize processing settings for full dataset
         if hasattr(self.config, 'PROCESSING'):
+            # CRITICAL: Prevent feature explosion that causes OOM
+            self.config.PROCESSING['cross_curve_features'] = True  # Keep enabled but limited
+            self.config.PROCESSING['max_cross_features'] = 20      # Hard limit instead of 10,000+
+            self.config.PROCESSING['sequence_features'] = False    # Disable LSTM sequences for production
+            self.logger.warning("⚠️  Limited cross-curve features and disabled LSTM sequences to prevent memory explosion")
+            
             # Reduce memory pressure with chunked processing
             self.config.PROCESSING['batch_size'] = 20  # Increased for full run
             self.config.PROCESSING['chunk_processing'] = True
