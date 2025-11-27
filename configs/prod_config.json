@@ -1,0 +1,190 @@
+{
+  "pipeline_info": {
+    "name": "Eagle Ford Production Configuration",
+    "description": "Full production configuration optimized for Kaggle/Colab resources with comprehensive features",
+    "version": "1.0",
+    "created_date": "2025-11-26",
+    "target_platform": ["kaggle", "colab"],
+    "expected_dataset_size": "large"
+  },
+  
+  "global": {
+    "run_mode": "production",
+    "target_column": "GR",
+    "formation": "eagle_ford",
+    "random_state": 42,
+    "n_jobs": -1,
+    "max_memory_usage": 0.9,
+    "output_compression": null,
+    "enable_gpu": true,
+    "chunk_processing": false,
+    "save_intermediate_files": true,
+    "detailed_logging": true,
+    "enable_caching": true
+  },
+  
+  "logging": {
+    "level": "INFO",
+    "enable_progress_bars": true,
+    "log_to_file": true,
+    "log_to_console": true,
+    "detailed_timing": true,
+    "memory_monitoring": true,
+    "save_debug_info": true,
+    "log_model_metrics": true,
+    "log_feature_importance": true
+  },
+  
+  "preprocessing": {
+    "input_pattern": "*.las",
+    "target_step_size": 1.0,
+    "quality_threshold": 0.5,
+    "batch_size": 100,
+    "completeness_threshold": 95.0,
+    "imputation_threshold": 20.0,
+    "outlier_mad_threshold": 5.0,
+    "gr_constraints": {
+      "min": 10.0,
+      "max": 250.0
+    },
+    "outlier_detection": true,
+    "outlier_method": "iqr",
+    "outlier_threshold": 3.0,
+    "geological_constraints": true,
+    "imputation_method": "knn",
+    "knn_neighbors": 5,
+    "interpolation_method": "linear",
+    "max_missing_percentage": 15.0,
+    "chunk_processing": false,
+    "chunk_size": 50000,
+    "temp_file_cleanup": false,
+    "save_processing_report": true,
+    "save_well_statistics": true,
+    "save_quality_metrics": true
+  },
+  
+  "feature_engineering": {
+    "rolling_windows": [5, 10, 20, 50],
+    "sequence_length": 50,
+    "target_curves": ["GR"],
+    "geological_features": true,
+    "cross_curve_features": true,
+    "depth_normalization": "minmax",
+    "feature_expansion_ratio": 20,
+    "gradient_orders": [1, 2],
+    "polynomial_degree": 3,
+    "enable_cross_features": true,
+    "max_cross_features": 1000,
+    "depth_features": true,
+    "formation_windows": [[8000, 12000], [10000, 14000]],
+    "lithology_indicators": true,
+    "completion_features": true,
+    "correlation_threshold": 0.98,
+    "variance_threshold": 0.001,
+    "feature_importance_selection": true,
+    "max_features": 2000,
+    "test_size": 0.2,
+    "validation_size": 0.15,
+    "stratify_by_operator": true,
+    "min_wells_per_split": 3,
+    "scaling_method": "robust",
+    "target_transformation": "box_cox",
+    "save_scalers": true,
+    "save_feature_importance": true,
+    "save_feature_statistics": true,
+    "save_correlation_matrix": true
+  },
+  
+  "machine_learning": {
+    "models": ["random_forest", "xgboost"],
+    "primary_metric": "r2",
+    "cv_folds": 5,
+    "search_method": "random",
+    "normalization": "box_cox",
+    "outlier_threshold": 3.0,
+    "optimization_method": "bayesian",
+    "max_optimization_time": 7200,
+    "n_iter_search": 100,
+    "early_stopping": true,
+    "early_stopping_patience": 15,
+    
+    "random_forest": {
+      "n_estimators_range": [200, 1500],
+      "max_depth_range": [15, 50],
+      "min_samples_split_range": [2, 15],
+      "min_samples_leaf_range": [1, 8],
+      "max_features": ["sqrt", "log2", 0.3, 0.5, 0.7],
+      "bootstrap": true,
+      "oob_score": true,
+      "n_jobs": -1,
+      "max_leaf_nodes": null
+    },
+    
+    "xgboost": {
+      "n_estimators_range": [200, 2000],
+      "max_depth_range": [4, 12],
+      "learning_rate_range": [0.01, 0.3],
+      "subsample_range": [0.7, 1.0],
+      "colsample_bytree_range": [0.7, 1.0],
+      "reg_alpha_range": [0, 2],
+      "reg_lambda_range": [0, 2],
+      "min_child_weight_range": [1, 10],
+      "gamma_range": [0, 1],
+      "objective": "reg:squarederror",
+      "eval_metric": "rmse",
+      "tree_method": "gpu_hist",
+      "n_jobs": -1,
+      "gpu_id": 0
+    },
+    
+    "feature_selection_method": "mutual_info",
+    "dimensionality_reduction": null,
+    "handle_class_imbalance": false,
+    "outlier_detection_ml": true,
+    "outlier_contamination": 0.05,
+    "enable_shap_analysis": true,
+    "shap_sample_size": 2000,
+    "feature_importance_plots": true,
+    "learning_curves": true,
+    "validation_curves": true,
+    "save_models": true,
+    "save_predictions": true,
+    "model_format": "joblib",
+    "compress_models": true,
+    "save_evaluation_metrics": true,
+    "save_hyperparameter_results": true,
+    "save_cross_validation_results": true
+  },
+  
+  "paths": {
+    "input_dir": "dataset/raw",
+    "output_dir": "whole_pipeline_output",
+    "logs_dir": "whole_pipeline_output/logs",
+    "preprocessing_dir": "whole_pipeline_output/preprocessing",
+    "features_dir": "whole_pipeline_output/features",
+    "models_dir": "whole_pipeline_output/models",
+    "reports_dir": "whole_pipeline_output/reports",
+    "plots_dir": "whole_pipeline_output/plots"
+  },
+  
+  "performance_optimization": {
+    "use_gpu_acceleration": true,
+    "parallel_processing": true,
+    "memory_efficient_loading": true,
+    "incremental_learning": false,
+    "model_ensemble": true,
+    "hyperparameter_optimization": "intensive",
+    "feature_selection_enabled": true,
+    "cross_validation_intensive": true
+  },
+  
+  "quality_assurance": {
+    "validate_inputs": true,
+    "validate_outputs": true,
+    "generate_qa_report": true,
+    "save_data_profiles": true,
+    "monitor_data_drift": true,
+    "save_model_interpretability": true,
+    "comprehensive_logging": true
+  }
+}

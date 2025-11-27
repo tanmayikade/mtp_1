@@ -15,6 +15,8 @@ import sys
 import logging
 import traceback
 import warnings
+import gc
+import psutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 import json
@@ -38,6 +40,87 @@ import seaborn as sns
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
+
+# Memory management utilities
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    except:
+        return 0
+
+def force_cleanup():
+    """Force garbage collection and return objects freed"""
+    collected = gc.collect()
+    return collected
+
+def memory_monitor_decorator(func):
+    """Decorator for automatic memory monitoring and cleanup"""
+    def wrapper(*args, **kwargs):
+        initial_memory = get_memory_usage()
+        try:
+            result = func(*args, **kwargs)
+            collected = force_cleanup()
+            final_memory = get_memory_usage()
+            
+            if hasattr(args[0], 'logger'):
+                args[0].logger.debug(f"🧹 {func.__name__}: freed {collected} objects, "
+                                   f"memory: {initial_memory:.1f}MB → {final_memory:.1f}MB")
+            return result
+        except Exception as e:
+            force_cleanup()  # Cleanup on error
+            raise e
+    return wrapper
+
+def clear_sklearn_cache():
+    """Clear scikit-learn internal caches"""
+    try:
+        from sklearn.utils._testing import clear_cache
+        clear_cache()
+    except:
+        pass
+
+def clear_matplotlib_cache():
+    """Clear matplotlib plots and cache - 2024 best practice order"""
+    try:
+        plt.clf()        # Clear current figure first
+        plt.cla()        # Clear current axes  
+        plt.close('all') # Then close all figures - prevents memory leaks
+        # Clear matplotlib memory completely
+        import matplotlib
+        matplotlib.use('Agg')  # Use non-interactive backend for Colab
+    except:
+        pass
+
+def memory_limit_decorator(max_memory_mb=8000):
+    """Decorator to check memory usage before function execution"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            current_memory = get_memory_usage()
+            if current_memory > max_memory_mb:
+                if hasattr(args[0], 'logger'):
+                    args[0].logger.warning(f"🔥 High memory usage detected: {current_memory:.1f}MB > {max_memory_mb}MB")
+                    args[0].logger.warning("⚠️ Triggering aggressive cleanup...")
+                
+                # Aggressive cleanup
+                clear_sklearn_cache()
+                clear_matplotlib_cache()
+                objects_freed = force_cleanup()
+                
+                new_memory = get_memory_usage()
+                if hasattr(args[0], 'logger'):
+                    args[0].logger.info(f"🧹 Emergency cleanup: {objects_freed} objects freed")
+                    args[0].logger.info(f"💾 Memory: {current_memory:.1f}MB → {new_memory:.1f}MB")
+                
+                if new_memory > max_memory_mb * 0.9:  # Still high after cleanup
+                    if hasattr(args[0], 'logger'):
+                        args[0].logger.error(f"❌ Memory still high after cleanup: {new_memory:.1f}MB")
+                    raise MemoryError(f"Memory usage too high: {new_memory:.1f}MB > {max_memory_mb}MB")
+            
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 class EagleFordMLTrainer:
     """
@@ -261,16 +344,19 @@ class EagleFordMLTrainer:
         self.logger.info("Loading feature-engineered data and splits")
         
         try:
+            # Convert input_dir to Path object if it's a string
+            input_path = Path(self.input_dir) if isinstance(self.input_dir, str) else self.input_dir
+            
             # Find the most recent feature engineering run or use specified input
-            if self.input_dir.name != "features":
+            if input_path.name != "features":
                 # Assume input_dir points to a specific run
-                features_file = self.input_dir / "master_dataset_features.csv"
-                splits_file = self.input_dir / "train_test_splits.json"
+                features_file = input_path / "master_dataset_features.csv"
+                splits_file = input_path / "train_test_splits.json"
             else:
                 # Look for most recent run
-                run_dirs = [d for d in self.input_dir.iterdir() if d.is_dir()]
+                run_dirs = [d for d in input_path.iterdir() if d.is_dir()]
                 if not run_dirs:
-                    raise FileNotFoundError(f"No feature engineering runs found in {self.input_dir}")
+                    raise FileNotFoundError(f"No feature engineering runs found in {input_path}")
                 
                 latest_run = max(run_dirs, key=lambda x: x.stat().st_mtime)
                 features_file = latest_run / "master_dataset_features.csv"
@@ -652,10 +738,12 @@ class EagleFordMLTrainer:
             self.logger.debug(traceback.format_exc())
             raise
             
+    @memory_monitor_decorator
     def train_model(self, model_name: str, X_train: pd.DataFrame, y_train: pd.Series, 
                    X_val: pd.DataFrame, y_val: pd.Series) -> Dict:
         """
         Train and optimize a model using RandomizedSearchCV, GridSearchCV, or both
+        MEMORY OPTIMIZED VERSION - includes automatic cleanup and monitoring
         
         Args:
             model_name: Model name ('random_forest' or 'xgboost')
@@ -670,8 +758,17 @@ class EagleFordMLTrainer:
         search_method = self.config['search_method']
         self.logger.info(f"Training {model_name} model with {search_method} search optimization")
         
+        # Memory monitoring at start
+        initial_memory = get_memory_usage()
+        self.logger.info(f"💾 Memory at training start: {initial_memory:.1f}MB")
+        
         try:
             config = self.model_configs[model_name]
+            
+            # Clear any existing caches before training
+            clear_sklearn_cache()
+            clear_matplotlib_cache()
+            force_cleanup()
             
             # Create base model
             base_model = config['model_class'](**config['fixed_params'])
@@ -721,6 +818,12 @@ class EagleFordMLTrainer:
                     search_results['best_method'] = 'random_search'
                 
                 self.logger.info(f"RandomizedSearchCV best score: {random_search.best_score_:.4f}")
+                
+                # Memory cleanup after RandomizedSearchCV
+                del random_search  # Free the search object
+                objects_freed = force_cleanup()
+                memory_after_random = get_memory_usage()
+                self.logger.info(f"🧹 After RandomizedSearchCV: {objects_freed} objects freed, memory: {memory_after_random:.1f}MB")
             
             # 2. GridSearchCV
             if search_method in ['grid', 'both']:
@@ -767,6 +870,12 @@ class EagleFordMLTrainer:
                     search_results['best_method'] = 'grid_search'
                 
                 self.logger.info(f"GridSearchCV best score: {grid_search.best_score_:.4f}")
+                
+                # Memory cleanup after GridSearchCV
+                del grid_search  # Free the search object
+                objects_freed = force_cleanup()
+                memory_after_grid = get_memory_usage()
+                self.logger.info(f"🧹 After GridSearchCV: {objects_freed} objects freed, memory: {memory_after_grid:.1f}MB")
             
             # If both methods used, log comparison
             if search_method == 'both':
@@ -780,11 +889,16 @@ class EagleFordMLTrainer:
                 self.logger.info(f"  Best method: {search_results['best_method']}")
                 self.logger.info(f"  Score improvement: {improvement:.4f}")
             
-            # Validate on validation set
-            val_predictions = best_model.predict(X_val)
-            val_r2 = r2_score(y_val, val_predictions)
-            val_rmse = np.sqrt(mean_squared_error(y_val, val_predictions))
-            val_mae = mean_absolute_error(y_val, val_predictions)
+            # Validate on validation set (features already aligned)
+            if len(X_val) > 0:
+                val_predictions = best_model.predict(X_val)
+                val_r2 = r2_score(y_val, val_predictions)
+                val_rmse = np.sqrt(mean_squared_error(y_val, val_predictions))
+                val_mae = mean_absolute_error(y_val, val_predictions)
+            else:
+                self.logger.warning("⚠️ Validation set is empty, skipping validation metrics")
+                val_predictions = np.array([])
+                val_r2 = val_rmse = val_mae = 0.0
             
             # Cross-validation scores on full training set
             # Adjust CV folds for small datasets
@@ -1062,10 +1176,7 @@ class EagleFordMLTrainer:
             top_n = min(20, len(indices))
             top_indices = indices[:top_n]
             
-            # Create feature importance plot
-            plt.figure(figsize=(12, 8))
-            
-            # Seaborn barplot for better aesthetics
+            # Ensure proper imports
             import matplotlib.pyplot as plt
             import seaborn as sns
             
@@ -1079,19 +1190,19 @@ class EagleFordMLTrainer:
             })
             
             # Create horizontal bar plot
-            plt.figure(figsize=(10, 8))
-            ax = sns.barplot(data=plot_data, y='feature', x='importance', 
-                           palette='viridis', orient='h')
+            fig, ax = plt.subplots(figsize=(10, 8))
+            sns.barplot(data=plot_data, y='feature', x='importance', 
+                       palette='viridis', orient='h', ax=ax)
             
-            plt.title(f'Top {top_n} Feature Importance - {model_name}', fontsize=14, fontweight='bold')
-            plt.xlabel('Feature Importance', fontsize=12)
-            plt.ylabel('Features', fontsize=12)
+            ax.set_title(f'Top {top_n} Feature Importance - {model_name}', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Feature Importance', fontsize=12)
+            ax.set_ylabel('Features', fontsize=12)
             plt.tight_layout()
             
             # Save plot
             importance_path = viz_dir / f"{model_name}_feature_importance.png"
-            plt.savefig(importance_path, dpi=300, bbox_inches='tight')
-            plt.close()
+            fig.savefig(importance_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
             
             self.logger.info(f"Feature importance plot saved: {importance_path}")
             
@@ -1103,6 +1214,10 @@ class EagleFordMLTrainer:
         """Create comprehensive SHAP visualizations using matplotlib and seaborn"""
         
         try:
+            # Import matplotlib here to avoid plt variable issues
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
             # 1. SHAP Summary Plot
             plt.figure(figsize=(12, 8))
             shap.summary_plot(shap_values, X_sample, feature_names=feature_names, 
@@ -1176,11 +1291,447 @@ class EagleFordMLTrainer:
                 comparison_path = viz_dir / f"{model_name}_importance_comparison.png"
                 plt.savefig(comparison_path, dpi=300, bbox_inches='tight')
                 plt.close()
+                
+            # 5. Eagle Ford Geological Context SHAP Analysis
+            self._create_geological_shap_analysis(shap_values, X_sample, feature_names, model_name, viz_dir)
             
             self.logger.info(f"SHAP visualizations created in {viz_dir}")
             
         except Exception as shap_viz_error:
             self.logger.warning(f"SHAP visualization creation failed: {shap_viz_error}")
+            self.logger.debug(f"SHAP error details: {str(shap_viz_error)}", exc_info=True)
+            
+    def _create_geological_shap_analysis(self, shap_values: np.ndarray, X_sample: pd.DataFrame, 
+                                       feature_names: List[str], model_name: str, viz_dir: Path):
+        """Create Eagle Ford-specific geological SHAP analysis"""
+        
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            # 1. Geological Feature Grouping Analysis
+            geological_groups = {
+                'Rolling Statistics': [f for f in feature_names if 'roll_' in f],
+                'Geological Indicators': [f for f in feature_names if any(x in f for x in ['is_', 'gr_', 'in_eagle'])],
+                'Gradient Features': [f for f in feature_names if any(x in f for x in ['gradient', 'diff', 'pct_change'])],
+                'Depth Features': [f for f in feature_names if 'depth' in f],
+                'Cross-Curve Features': [f for f in feature_names if any(x in f for x in ['ROP', 'TVD', 'VS', 'TEMP'])],
+                'Curvature Features': [f for f in feature_names if 'curvature' in f]
+            }
+            
+            # Calculate group-wise SHAP importance
+            mean_shap = np.mean(np.abs(shap_values), axis=0)
+            group_importance = {}
+            
+            for group_name, group_features in geological_groups.items():
+                group_indices = [i for i, fname in enumerate(feature_names) if fname in group_features]
+                if group_indices:
+                    group_importance[group_name] = np.sum(mean_shap[group_indices])
+                else:
+                    group_importance[group_name] = 0.0
+            
+            # Plot geological group importance
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            
+            # Group importance pie chart
+            groups = list(group_importance.keys())
+            importances = list(group_importance.values())
+            
+            colors = plt.cm.Set3(np.linspace(0, 1, len(groups)))
+            wedges, texts, autotexts = ax1.pie(importances, labels=groups, autopct='%1.1f%%', 
+                                              colors=colors, startangle=90)
+            ax1.set_title(f'SHAP Importance by Geological Feature Group\n{model_name}', fontweight='bold')
+            
+            # Top features with geological annotation
+            top_15_idx = np.argsort(mean_shap)[::-1][:15]
+            top_features = [feature_names[i] for i in top_15_idx]
+            top_shap = mean_shap[top_15_idx]
+            
+            # Color code by geological group
+            feature_colors = []
+            for feature in top_features:
+                for group, group_features in geological_groups.items():
+                    if feature in group_features:
+                        if 'Rolling' in group:
+                            feature_colors.append('#1f77b4')  # Blue
+                        elif 'Geological' in group:
+                            feature_colors.append('#ff7f0e')  # Orange
+                        elif 'Gradient' in group:
+                            feature_colors.append('#2ca02c')  # Green
+                        elif 'Depth' in group:
+                            feature_colors.append('#d62728')  # Red
+                        elif 'Cross-Curve' in group:
+                            feature_colors.append('#9467bd')  # Purple
+                        else:
+                            feature_colors.append('#8c564b')  # Brown
+                        break
+                else:
+                    feature_colors.append('#7f7f7f')  # Gray for ungrouped
+            
+            bars = ax2.barh(range(len(top_features)), top_shap, color=feature_colors)
+            ax2.set_yticks(range(len(top_features)))
+            ax2.set_yticklabels(top_features)
+            ax2.set_xlabel('Mean |SHAP Value|')
+            ax2.set_title(f'Top 15 Features by SHAP Importance\n{model_name}', fontweight='bold')
+            ax2.invert_yaxis()
+            
+            # Add legend for colors
+            legend_elements = [
+                plt.Rectangle((0,0),1,1, facecolor='#1f77b4', label='Rolling Statistics'),
+                plt.Rectangle((0,0),1,1, facecolor='#ff7f0e', label='Geological Indicators'),
+                plt.Rectangle((0,0),1,1, facecolor='#2ca02c', label='Gradient Features'),
+                plt.Rectangle((0,0),1,1, facecolor='#d62728', label='Depth Features'),
+                plt.Rectangle((0,0),1,1, facecolor='#9467bd', label='Cross-Curve Features'),
+                plt.Rectangle((0,0),1,1, facecolor='#8c564b', label='Other')
+            ]
+            ax2.legend(handles=legend_elements, loc='lower right', fontsize=9)
+            
+            plt.tight_layout()
+            geological_path = viz_dir / f"{model_name}_shap_geological.png"
+            plt.savefig(geological_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            # 2. Lithology-specific SHAP Analysis
+            # Find lithology indicator features
+            lithology_features = {}
+            for i, fname in enumerate(feature_names):
+                if 'is_clean_sand' in fname:
+                    lithology_features['Clean Sand'] = i
+                elif 'is_shale' in fname:
+                    lithology_features['Shale'] = i
+                elif 'is_mixed_lithology' in fname:
+                    lithology_features['Mixed Lithology'] = i
+            
+            if lithology_features:
+                fig, ax = plt.subplots(figsize=(12, 8))
+                
+                # Create box plots for SHAP values by lithology
+                lithology_data = []
+                lithology_names = []
+                
+                for litho_name, feat_idx in lithology_features.items():
+                    lithology_data.append(shap_values[:, feat_idx])
+                    lithology_names.append(litho_name)
+                
+                bp = ax.boxplot(lithology_data, labels=lithology_names, patch_artist=True)
+                
+                # Color the boxes
+                colors = ['lightblue', 'lightcoral', 'lightgreen']
+                for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
+                
+                ax.set_title(f'SHAP Values Distribution by Lithology Indicators\n{model_name}', 
+                           fontweight='bold', fontsize=14)
+                ax.set_ylabel('SHAP Value')
+                ax.set_xlabel('Lithology Type')
+                ax.grid(True, alpha=0.3)
+                
+                # Add annotations with Eagle Ford geological context
+                ax.text(0.02, 0.98, 'Eagle Ford Formation Context:\n• Clean Sand: 0-75 API\n• Shaly Sand: 75-150 API\n• Shale: 150-300 API', 
+                       transform=ax.transAxes, verticalalignment='top', fontsize=10,
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                
+                lithology_path = viz_dir / f"{model_name}_shap_lithology.png"
+                plt.savefig(lithology_path, dpi=300, bbox_inches='tight')
+                plt.close()
+            
+            # 3. SHAP Dependence Plots for Top Geological Features
+            top_geological_features = []
+            for group_name, group_features in geological_groups.items():
+                if group_name in ['Rolling Statistics', 'Geological Indicators']:
+                    group_indices = [i for i, fname in enumerate(feature_names) if fname in group_features]
+                    if group_indices:
+                        group_shap = mean_shap[group_indices]
+                        top_in_group = np.argmax(group_shap)
+                        top_geological_features.append(group_indices[top_in_group])
+            
+            if len(top_geological_features) >= 2:
+                fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+                
+                for i, feat_idx in enumerate(top_geological_features[:2]):
+                    feature_name = feature_names[feat_idx]
+                    
+                    # Scatter plot with color-coded SHAP values
+                    scatter = axes[i].scatter(X_sample.iloc[:, feat_idx], shap_values[:, feat_idx], 
+                                           c=X_sample.iloc[:, feat_idx], cmap='viridis', alpha=0.6)
+                    axes[i].set_xlabel(f'{feature_name}')
+                    axes[i].set_ylabel('SHAP value')
+                    axes[i].set_title(f'SHAP Dependence: {feature_name}')
+                    axes[i].grid(True, alpha=0.3)
+                    
+                    # Add colorbar
+                    plt.colorbar(scatter, ax=axes[i], label='Feature Value')
+                
+                plt.suptitle(f'SHAP Dependence Plots - Key Geological Features\n{model_name}', 
+                           fontweight='bold', fontsize=14)
+                plt.tight_layout()
+                
+                dependence_path = viz_dir / f"{model_name}_shap_dependence.png"
+                plt.savefig(dependence_path, dpi=300, bbox_inches='tight')
+                plt.close()
+            
+            self.logger.info(f"Geological SHAP analysis completed for {model_name}")
+            
+        except Exception as geo_shap_error:
+            self.logger.warning(f"Geological SHAP analysis failed: {geo_shap_error}")
+            self.logger.debug(f"Geological SHAP error details: {str(geo_shap_error)}", exc_info=True)
+    
+    def create_learning_curves(self, model, model_name: str, X_train: pd.DataFrame, y_train: pd.Series) -> Dict:
+        """
+        Create learning curves using 2025 sklearn best practices
+        
+        Args:
+            model: Trained model
+            model_name: Model name
+            X_train: Training features
+            y_train: Training target
+            
+        Returns:
+            Learning curves results
+        """
+        self.logger.info(f"Creating learning curves for {model_name}")
+        
+        try:
+            import matplotlib.pyplot as plt
+            from sklearn.model_selection import LearningCurveDisplay, ShuffleSplit
+            import numpy as np
+            
+            # Create visualization directory
+            viz_dir = self.output_dir / model_name / "visualizations"
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Modern sklearn 2025 approach with comprehensive parameters
+            common_params = {
+                "train_sizes": np.linspace(0.1, 1.0, 10),
+                "cv": ShuffleSplit(n_splits=5, test_size=0.2, random_state=42),
+                "n_jobs": min(4, self.config.get('n_jobs', 4)),
+                "line_kw": {"marker": "o", "markersize": 4},
+                "std_display_style": "fill_between",
+                "score_name": "R² Score",
+                "scoring": "r2"
+            }
+            
+            # Create learning curve display
+            fig, ax = plt.subplots(figsize=(10, 6))
+            display = LearningCurveDisplay.from_estimator(
+                model, X_train, y_train, ax=ax, **common_params
+            )
+            
+            # Enhance plot for Eagle Ford context
+            ax.set_title(f'Learning Curves - {model_name}\nEagle Ford Gamma Ray Prediction', 
+                        fontsize=14, fontweight='bold')
+            ax.set_xlabel('Training Set Size (samples)', fontsize=12)
+            ax.set_ylabel('R² Score', fontsize=12)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='lower right')
+            
+            # Add geological context annotation
+            ax.text(0.02, 0.98, 'Eagle Ford Formation\nGamma Ray Log Prediction', 
+                   transform=ax.transAxes, fontsize=10, verticalalignment='top',
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.7))
+            
+            plt.tight_layout()
+            
+            # Save learning curves
+            learning_curve_path = viz_dir / f"{model_name}_learning_curves.png"
+            fig.savefig(learning_curve_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            
+            self.logger.info(f"Learning curves saved: {learning_curve_path}")
+            
+            return {
+                'learning_curve_path': str(learning_curve_path),
+                'train_sizes': display.train_sizes_,
+                'train_scores': display.train_scores_,
+                'test_scores': display.test_scores_
+            }
+            
+        except Exception as lc_error:
+            self.logger.warning(f"Learning curves creation failed: {lc_error}")
+            self.logger.debug(f"Learning curves error details: {str(lc_error)}", exc_info=True)
+            return {}
+    
+    def create_prediction_visualizations(self, model, model_name: str, X_test: pd.DataFrame, y_test: pd.Series) -> Dict:
+        """
+        Create Eagle Ford-specific prediction visualizations including depth plots
+        
+        Args:
+            model: Trained model
+            model_name: Model name  
+            X_test: Test features
+            y_test: Test target
+            
+        Returns:
+            Prediction visualization results
+        """
+        self.logger.info(f"Creating Eagle Ford prediction visualizations for {model_name}")
+        
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            import numpy as np
+            
+            # Create visualization directory
+            viz_dir = self.output_dir / model_name / "visualizations"
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate predictions
+            y_pred = model.predict(X_test)
+            
+            # 1. Predicted vs Actual (Eagle Ford context)
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+            
+            # Plot 1: Predicted vs Actual scatter
+            ax1.scatter(y_test, y_pred, alpha=0.6, s=20, c='steelblue')
+            ax1.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+            ax1.set_xlabel('Actual Gamma Ray (API)', fontsize=12)
+            ax1.set_ylabel('Predicted Gamma Ray (API)', fontsize=12)
+            ax1.set_title(f'{model_name} - Predicted vs Actual\nEagle Ford Formation', fontsize=14, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+            
+            # Add R² annotation
+            from sklearn.metrics import r2_score
+            r2 = r2_score(y_test, y_pred)
+            ax1.text(0.05, 0.95, f'R² = {r2:.4f}', transform=ax1.transAxes, 
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                    fontsize=11, fontweight='bold')
+            
+            # Plot 2: Residuals plot
+            residuals = y_test - y_pred
+            ax2.scatter(y_pred, residuals, alpha=0.6, s=20, c='orange')
+            ax2.axhline(y=0, color='r', linestyle='--')
+            ax2.set_xlabel('Predicted Gamma Ray (API)', fontsize=12)
+            ax2.set_ylabel('Residuals (API)', fontsize=12)
+            ax2.set_title('Residuals Plot', fontsize=14, fontweight='bold')
+            ax2.grid(True, alpha=0.3)
+            
+            # Plot 3: Histogram of residuals
+            ax3.hist(residuals, bins=30, alpha=0.7, color='lightcoral', edgecolor='black')
+            ax3.set_xlabel('Residuals (API)', fontsize=12)
+            ax3.set_ylabel('Frequency', fontsize=12)
+            ax3.set_title('Distribution of Residuals', fontsize=14, fontweight='bold')
+            ax3.grid(True, alpha=0.3)
+            
+            # Add mean and std annotation
+            ax3.axvline(residuals.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean: {residuals.mean():.2f}')
+            ax3.axvline(residuals.std(), color='blue', linestyle='--', linewidth=2, label=f'Std: {residuals.std():.2f}')
+            ax3.axvline(-residuals.std(), color='blue', linestyle='--', linewidth=2)
+            ax3.legend()
+            
+            # Plot 4: Gamma Ray range analysis (Eagle Ford specific)
+            gr_ranges = {
+                'Clean Sand': (0, 75),
+                'Shaly Sand': (75, 150), 
+                'Shale': (150, 300)
+            }
+            
+            range_accuracy = {}
+            for range_name, (min_val, max_val) in gr_ranges.items():
+                mask = (y_test >= min_val) & (y_test < max_val)
+                if mask.sum() > 0:
+                    range_r2 = r2_score(y_test[mask], y_pred[mask])
+                    range_accuracy[range_name] = range_r2
+                    
+            if range_accuracy:
+                ranges = list(range_accuracy.keys())
+                accuracies = list(range_accuracy.values())
+                colors = ['lightgreen', 'gold', 'lightcoral'][:len(ranges)]
+                
+                bars = ax4.bar(ranges, accuracies, color=colors, alpha=0.7, edgecolor='black')
+                ax4.set_ylabel('R² Score', fontsize=12)
+                ax4.set_title('Accuracy by Gamma Ray Range\n(Eagle Ford Lithology)', fontsize=14, fontweight='bold')
+                ax4.set_ylim(0, 1)
+                ax4.grid(True, alpha=0.3)
+                
+                # Add value labels on bars
+                for bar, acc in zip(bars, accuracies):
+                    height = bar.get_height()
+                    ax4.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                            f'{acc:.3f}', ha='center', va='bottom', fontweight='bold')
+            
+            plt.tight_layout()
+            
+            # Save prediction analysis
+            pred_viz_path = viz_dir / f"{model_name}_prediction_analysis.png"
+            fig.savefig(pred_viz_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            
+            # 2. Depth plot (if depth information available)
+            if 'DEPTH' in X_test.columns or 'depth_normalized' in X_test.columns:
+                self._create_depth_plot(model_name, X_test, y_test, y_pred, viz_dir)
+            
+            self.logger.info(f"Prediction visualizations saved: {pred_viz_path}")
+            
+            return {
+                'prediction_viz_path': str(pred_viz_path),
+                'r2_score': float(r2),
+                'residual_stats': {
+                    'mean': float(residuals.mean()),
+                    'std': float(residuals.std()),
+                    'rmse': float(np.sqrt(np.mean(residuals**2)))
+                },
+                'range_accuracy': range_accuracy
+            }
+            
+        except Exception as pred_error:
+            self.logger.warning(f"Prediction visualizations creation failed: {pred_error}")
+            self.logger.debug(f"Prediction error details: {str(pred_error)}", exc_info=True)
+            return {}
+    
+    def _create_depth_plot(self, model_name: str, X_test: pd.DataFrame, y_test: pd.Series, 
+                          y_pred: np.ndarray, viz_dir: Path):
+        """Create depth-based gamma ray log visualization"""
+        try:
+            import matplotlib.pyplot as plt
+            
+            # Get depth information
+            if 'DEPTH' in X_test.columns:
+                depth = X_test['DEPTH']
+            elif 'depth_normalized' in X_test.columns:
+                # Approximate depth from normalized values
+                depth = X_test['depth_normalized'] * 1000 + 8000  # Approximate Eagle Ford depth range
+            else:
+                return
+            
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 8))
+            
+            # Plot 1: Actual vs Predicted by depth
+            ax1.plot(y_test, depth, 'b-', linewidth=1.5, label='Actual GR', alpha=0.8)
+            ax1.plot(y_pred, depth, 'r--', linewidth=1.5, label='Predicted GR', alpha=0.8)
+            ax1.set_xlabel('Gamma Ray (API)', fontsize=12)
+            ax1.set_ylabel('Depth (ft)', fontsize=12)
+            ax1.set_title(f'{model_name}\nGamma Ray Log Prediction', fontsize=14, fontweight='bold')
+            ax1.invert_yaxis()  # Typical well log convention
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            
+            # Add Eagle Ford formation window if applicable
+            eagle_ford_top = 8000
+            eagle_ford_bottom = 12000
+            ax1.axhspan(eagle_ford_top, eagle_ford_bottom, alpha=0.2, color='yellow', 
+                       label='Eagle Ford Window')
+            
+            # Plot 2: Prediction error by depth
+            error = np.abs(y_test - y_pred)
+            ax2.plot(error, depth, 'g-', linewidth=1.5, alpha=0.8)
+            ax2.set_xlabel('Prediction Error (API)', fontsize=12)
+            ax2.set_ylabel('Depth (ft)', fontsize=12)
+            ax2.set_title('Prediction Error by Depth', fontsize=14, fontweight='bold')
+            ax2.invert_yaxis()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save depth plot
+            depth_plot_path = viz_dir / f"{model_name}_depth_analysis.png"
+            fig.savefig(depth_plot_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            
+            self.logger.info(f"Depth plot saved: {depth_plot_path}")
+            
+        except Exception as depth_error:
+            self.logger.debug(f"Depth plot creation failed: {depth_error}")
             
     def save_model_artifacts(self, model, model_name: str, results: Dict):
         """
@@ -1208,7 +1759,18 @@ class EagleFordMLTrainer:
             with open(results_path, 'w') as f:
                 # Convert numpy types for JSON serialization
                 def convert_numpy(obj):
-                    if isinstance(obj, np.integer):
+                    from sklearn.base import BaseEstimator
+                    import xgboost as xgb
+                    from sklearn.ensemble import RandomForestRegressor
+                    
+                    # Check for model objects first (most specific)
+                    if isinstance(obj, (BaseEstimator, xgb.XGBRegressor, RandomForestRegressor)):
+                        return f"<{obj.__class__.__name__} model object - not serializable>"
+                    elif hasattr(obj, '__module__') and ('sklearn' in obj.__module__ or 'xgboost' in obj.__module__):
+                        return f"<{obj.__class__.__name__} model object - not serializable>"
+                    elif str(type(obj).__name__) in ['RandomForestRegressor', 'XGBRegressor', 'Pipeline', 'GridSearchCV', 'RandomizedSearchCV']:
+                        return f"<{obj.__class__.__name__} model object - not serializable>"
+                    elif isinstance(obj, np.integer):
                         return int(obj)
                     elif isinstance(obj, np.floating):
                         return float(obj)
@@ -1232,7 +1794,7 @@ class EagleFordMLTrainer:
             
     def run_ml_pipeline(self) -> bool:
         """
-        Run the complete ML training pipeline
+        Run the complete ML training pipeline with memory optimization
         
         Returns:
             Success flag
@@ -1242,40 +1804,125 @@ class EagleFordMLTrainer:
         self.logger.info("EAGLE FORD ML TRAINING PIPELINE STARTED")
         self.logger.info("="*50)
         
+        # Memory monitoring at pipeline start
+        initial_pipeline_memory = get_memory_usage()
+        self.logger.info(f"💾 Pipeline start memory: {initial_pipeline_memory:.1f}MB")
+        
         try:
             # 1. Load data and splits
+            self.logger.info("📂 Loading data and splits...")
+            load_memory_before = get_memory_usage()
             df_features, splits = self.load_data_and_splits()
+            load_memory_after = get_memory_usage()
+            self.logger.info(f"💾 After data loading: {load_memory_after:.1f}MB (Δ: +{load_memory_after - load_memory_before:.1f}MB)")
             
             # 2. Apply preprocessing
+            self.logger.info("🔧 Applying preprocessing...")
+            preprocess_memory_before = get_memory_usage()
             df_processed = self.apply_preprocessing(df_features)
             
+            # Clean up original features dataframe
+            del df_features
+            objects_freed = force_cleanup()
+            preprocess_memory_after = get_memory_usage()
+            self.logger.info(f"💾 After preprocessing: {preprocess_memory_after:.1f}MB (Δ: {preprocess_memory_after - preprocess_memory_before:.1f}MB)")
+            self.logger.info(f"🧹 Freed {objects_freed} objects after original data cleanup")
+            
             # 3. Create train/val/test sets
+            self.logger.info("✂️ Creating train/val/test sets...")
+            split_memory_before = get_memory_usage()
             train_df, val_df, test_df = self.create_train_val_test_sets(df_processed, splits)
             
+            # Clean up processed dataframe after splitting
+            del df_processed
+            objects_freed = force_cleanup()
+            split_memory_after = get_memory_usage()
+            self.logger.info(f"💾 After data splitting: {split_memory_after:.1f}MB (Δ: {split_memory_after - split_memory_before:.1f}MB)")
+            self.logger.info(f"🧹 Freed {objects_freed} objects after processed data cleanup")
+            
             # 4. Prepare features and targets
+            self.logger.info("🎯 Preparing features and targets...")
+            features_memory_before = get_memory_usage()
             X_train, y_train = self.prepare_features_and_target(train_df)
             X_val, y_val = self.prepare_features_and_target(val_df)
             X_test, y_test = self.prepare_features_and_target(test_df)
             
+            # Clean up dataframes after feature extraction
+            del train_df, val_df, test_df
+            objects_freed = force_cleanup()
+            features_memory_after = get_memory_usage()
+            self.logger.info(f"💾 After feature preparation: {features_memory_after:.1f}MB (Δ: {features_memory_after - features_memory_before:.1f}MB)")
+            self.logger.info(f"🧹 Freed {objects_freed} objects after dataframe cleanup")
+            
+            # 5. Ensure feature consistency across all splits
+            self.logger.debug(f"🔍 Pre-alignment feature counts: Train={X_train.shape[1]}, Val={X_val.shape[1]}, Test={X_test.shape[1]}")
+            
+            # Find common features across all splits
+            common_features = set(X_train.columns)
+            if len(X_val) > 0:
+                common_features = common_features.intersection(set(X_val.columns))
+            if len(X_test) > 0:
+                common_features = common_features.intersection(set(X_test.columns))
+            
+            common_features = sorted(list(common_features))
+            self.logger.info(f"🔧 Aligned to {len(common_features)} common features across all splits")
+            
+            # Apply feature alignment to all sets
+            X_train = X_train[common_features]
+            if len(X_val) > 0:
+                X_val = X_val[common_features]
+            if len(X_test) > 0:
+                X_test = X_test[common_features]
+            
             self.logger.info(f"Final dataset sizes:")
             self.logger.info(f"  Train: {X_train.shape[0]:,} samples, {X_train.shape[1]} features")
-            self.logger.info(f"  Validation: {X_val.shape[0]:,} samples")
-            self.logger.info(f"  Test: {X_test.shape[0]:,} samples")
+            self.logger.info(f"  Validation: {X_val.shape[0]:,} samples, {X_val.shape[1]} features")
+            self.logger.info(f"  Test: {X_test.shape[0]:,} samples, {X_test.shape[1]} features")
             
             # Store feature names
             feature_names = list(X_train.columns)
             
-            # 5. Train models
+            # 5. Train models with memory optimization
             models_to_train = ['random_forest', 'xgboost']
             
-            for model_name in models_to_train:
-                self.logger.info(f"\n{'='*20} Training {model_name.upper()} {'='*20}")
+            for i, model_name in enumerate(models_to_train):
+                self.logger.info(f"\n{'='*20} Training {model_name.upper()} ({i+1}/{len(models_to_train)}) {'='*20}")
+                
+                # Memory check before model training
+                pre_model_memory = get_memory_usage()
+                self.logger.info(f"💾 Memory before {model_name} training: {pre_model_memory:.1f}MB")
                 
                 # Train model
+                self.logger.debug(f"🔧 Training {model_name} with features: {list(X_train.columns)}")
+                self.logger.debug(f"📊 Training data shape: {X_train.shape}, Target shape: {y_train.shape}")
+                if len(X_val) > 0:
+                    self.logger.debug(f"📊 Validation data shape: {X_val.shape}, Target shape: {y_val.shape}")
+                else:
+                    self.logger.debug("⚠️ Validation set is empty")
+                
                 training_results = self.train_model(model_name, X_train, y_train, X_val, y_val)
                 
-                # Evaluate on test set
+                # Evaluate on test set (features already aligned)
                 evaluation_results = self.evaluate_model(
+                    training_results['model'], model_name, X_test, y_test
+                )
+                
+                # Learning curves analysis (2025 best practices)
+                learning_curves_results = self.create_learning_curves(
+                    training_results['model'], model_name, X_train, y_train
+                )
+                
+                # Memory cleanup after each model to prevent accumulation
+                clear_sklearn_cache()
+                clear_matplotlib_cache()
+                objects_freed = force_cleanup()
+                post_model_memory = get_memory_usage()
+                
+                self.logger.info(f"💾 Memory after {model_name}: {post_model_memory:.1f}MB (Δ: {post_model_memory - pre_model_memory:.1f}MB)")
+                self.logger.info(f"🧹 Cleaned {objects_freed} objects after {model_name} training")
+                
+                # Eagle Ford-specific prediction visualizations
+                prediction_results = self.create_prediction_visualizations(
                     training_results['model'], model_name, X_test, y_test
                 )
                 
@@ -1287,6 +1934,8 @@ class EagleFordMLTrainer:
                 # Combine all results
                 combined_results = {
                     'training': training_results,
+                    'learning_curves': learning_curves_results,
+                    'predictions': prediction_results,
                     'evaluation': evaluation_results,
                     'feature_importance': importance_results
                 }
@@ -1327,7 +1976,18 @@ class EagleFordMLTrainer:
             final_results_path = self.output_dir / "ml_training_results.json"
             with open(final_results_path, 'w') as f:
                 def convert_numpy(obj):
-                    if isinstance(obj, np.integer):
+                    from sklearn.base import BaseEstimator
+                    import xgboost as xgb
+                    from sklearn.ensemble import RandomForestRegressor
+                    
+                    # Check for model objects first (most specific)
+                    if isinstance(obj, (BaseEstimator, xgb.XGBRegressor, RandomForestRegressor)):
+                        return f"<{obj.__class__.__name__} model object - not serializable>"
+                    elif hasattr(obj, '__module__') and ('sklearn' in obj.__module__ or 'xgboost' in obj.__module__):
+                        return f"<{obj.__class__.__name__} model object - not serializable>"
+                    elif str(type(obj).__name__) in ['RandomForestRegressor', 'XGBRegressor', 'Pipeline', 'GridSearchCV', 'RandomizedSearchCV']:
+                        return f"<{obj.__class__.__name__} model object - not serializable>"
+                    elif isinstance(obj, np.integer):
                         return int(obj)
                     elif isinstance(obj, np.floating):
                         return float(obj)

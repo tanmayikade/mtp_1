@@ -17,6 +17,8 @@ import sys
 import logging
 import traceback
 import warnings
+import gc
+import psutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import json
@@ -27,8 +29,41 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.decomposition import PCA
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
+
+# Memory management utilities
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    except:
+        return 0
+
+def force_cleanup():
+    """Force garbage collection and return objects freed"""
+    collected = gc.collect()
+    return collected
+
+def memory_efficient_decorator(func):
+    """Decorator for automatic memory cleanup"""
+    def wrapper(*args, **kwargs):
+        initial_memory = get_memory_usage()
+        try:
+            result = func(*args, **kwargs)
+            collected = force_cleanup()
+            final_memory = get_memory_usage()
+            
+            if hasattr(args[0], 'logger'):
+                args[0].logger.debug(f"🧹 {func.__name__}: freed {collected} objects, "
+                                   f"memory: {initial_memory:.1f}MB → {final_memory:.1f}MB")
+            return result
+        except Exception as e:
+            force_cleanup()  # Cleanup on error
+            raise e
+    return wrapper
 
 class EagleFordFeatureEngineer:
     """
@@ -138,10 +173,13 @@ class EagleFordFeatureEngineer:
         self.logger.info(f"Loading master dataset from {self.input_file}")
         
         try:
-            if not self.input_file.exists():
-                raise FileNotFoundError(f"Master dataset not found: {self.input_file}")
+            # Convert input_file to Path object if it's a string
+            input_path = Path(self.input_file) if isinstance(self.input_file, str) else self.input_file
+            
+            if not input_path.exists():
+                raise FileNotFoundError(f"Master dataset not found: {input_path}")
                 
-            df = pd.read_csv(self.input_file)
+            df = pd.read_csv(input_path)
             
             self.logger.info(f"Loaded dataset: {len(df):,} records, {len(df.columns)} columns")
             
@@ -697,27 +735,54 @@ class EagleFordFeatureEngineer:
             np.random.seed(42)  # Reproducible splits
             train_wells, val_wells, test_wells = [], [], []
             
-            for operator, wells_list in operator_wells.items():
-                n_wells = len(wells_list)
-                self.logger.debug(f"Splitting {n_wells} wells for operator {operator}")
+            # Global split logic - ignore operators for small datasets
+            total_wells = len(wells)
+            self.logger.info(f"🔍 Split configuration: train_ratio={train_ratio}, val_ratio={val_ratio}, test_ratio={test_ratio}")
+            self.logger.info(f"📊 Total wells to split: {total_wells}")
+            self.logger.debug(f"📋 Wells list: {wells}")
+            
+            if val_ratio > 0.0 and total_wells >= 3:
+                self.logger.info("✅ Using global split (validation requested and sufficient wells)")
+                # Respect validation ratio when explicitly configured
+                np.random.shuffle(wells)
                 
-                if n_wells == 1:
-                    # Single well goes to training
-                    train_wells.extend(wells_list)
-                elif n_wells == 2:
-                    # Two wells: one to train, one to test
-                    train_wells.append(wells_list[0])
-                    test_wells.append(wells_list[1])
-                else:
-                    # Multiple wells: proper split
-                    np.random.shuffle(wells_list)
+                n_train = max(1, int(total_wells * train_ratio))
+                n_val = max(1, int(total_wells * val_ratio)) if val_ratio > 0 else 0
+                n_test = total_wells - n_train - n_val
+                
+                if n_test < 1:
+                    n_test = 1
+                    n_val = max(0, total_wells - n_train - n_test)
+                
+                train_wells = wells[:n_train].tolist()
+                val_wells = wells[n_train:n_train+n_val].tolist()
+                test_wells = wells[n_train+n_val:].tolist()
+                
+                self.logger.info(f"✅ Global split: {n_train} train, {n_val} val, {n_test} test wells")
+                self.logger.debug(f"📋 Train wells: {train_wells}")
+                self.logger.debug(f"📋 Validation wells: {val_wells}")  
+                self.logger.debug(f"📋 Test wells: {test_wells}")
+                
+            else:
+                # Fallback: per-operator split for complex cases or no validation
+                self.logger.info("⚠️ Using per-operator split (no validation requested or insufficient wells)")
+                for operator, wells_list in operator_wells.items():
+                    n_wells = len(wells_list)
+                    self.logger.debug(f"Splitting {n_wells} wells for operator {operator}")
                     
-                    n_train = max(1, int(n_wells * train_ratio))
-                    n_val = max(0, int(n_wells * val_ratio))
-                    
-                    train_wells.extend(wells_list[:n_train])
-                    val_wells.extend(wells_list[n_train:n_train+n_val])
-                    test_wells.extend(wells_list[n_train+n_val:])
+                    if n_wells == 1:
+                        train_wells.extend(wells_list)
+                    elif n_wells == 2:
+                        train_wells.append(wells_list[0])
+                        test_wells.append(wells_list[1])
+                    else:
+                        np.random.shuffle(wells_list)
+                        n_train = max(1, int(n_wells * train_ratio))
+                        n_val = max(0, int(n_wells * val_ratio))
+                        
+                        train_wells.extend(wells_list[:n_train])
+                        val_wells.extend(wells_list[n_train:n_train+n_val])
+                        test_wells.extend(wells_list[n_train+n_val:])
                     
             # Create split statistics
             train_records = len(feature_df[feature_df['well_api'].isin(train_wells)])
@@ -867,25 +932,75 @@ class EagleFordFeatureEngineer:
         try:
             # Load master dataset
             master_df = self.load_master_dataset()
+            initial_memory = get_memory_usage()
+            self.logger.info(f"💾 Initial memory usage: {initial_memory:.1f}MB")
             
-            # Process features well by well
-            self.logger.info("Processing features by well...")
-            
-            processed_wells = []
-            
-            for well_api in master_df['well_api'].unique():
-                df_well = master_df[master_df['well_api'] == well_api]
-                
-                self.logger.debug(f"Processing well {well_api}: {len(df_well)} records")
-                
-                df_well_features = self.process_well(df_well, well_api)
-                processed_wells.append(df_well_features)
-                
-            # Combine all processed wells
-            feature_df = pd.concat(processed_wells, ignore_index=True)
-            
-            # Feature summary
+            # Store original column info before processing
             original_cols = set(master_df.columns)
+            
+            # Process features well by well with CHUNKED PROCESSING
+            self.logger.info("Processing features by well with memory optimization...")
+            
+            # Process in chunks to avoid memory accumulation
+            unique_wells = master_df['well_api'].unique()
+            chunk_size = 5  # Process 5 wells at a time
+            feature_df_chunks = []
+            
+            # Use tqdm for progress tracking
+            total_chunks = (len(unique_wells) + chunk_size - 1) // chunk_size
+            
+            for i in tqdm(range(0, len(unique_wells), chunk_size), 
+                         desc="Processing well chunks", 
+                         total=total_chunks,
+                         unit="chunk"):
+                
+                chunk_wells = unique_wells[i:i + chunk_size]
+                self.logger.info(f"🔄 Processing wells chunk {i//chunk_size + 1}/{total_chunks}: {len(chunk_wells)} wells")
+                
+                chunk_processed = []
+                
+                # Process individual wells in chunk with progress
+                for well_api in tqdm(chunk_wells, desc=f"Chunk {i//chunk_size + 1} wells", leave=False):
+                    df_well = master_df[master_df['well_api'] == well_api]
+                    self.logger.debug(f"Processing well {well_api}: {len(df_well)} records")
+                    
+                    df_well_features = self.process_well(df_well, well_api)
+                    chunk_processed.append(df_well_features)
+                    
+                    # Clean up individual well data immediately
+                    del df_well
+                    force_cleanup()
+                
+                # Combine chunk and clean up
+                if chunk_processed:
+                    chunk_df = pd.concat(chunk_processed, ignore_index=True)
+                    feature_df_chunks.append(chunk_df)
+                    
+                    # Clean up chunk processing arrays
+                    del chunk_processed
+                    current_memory = get_memory_usage()
+                    self.logger.info(f"💾 Memory after chunk {i//chunk_size + 1}: {current_memory:.1f}MB")
+                    force_cleanup()
+            
+            # Clean up master dataset before final concat
+            del master_df
+            force_cleanup()
+            
+            # Final concatenation with memory monitoring
+            self.logger.info("📋 Combining all processed chunks...")
+            pre_concat_memory = get_memory_usage()
+            feature_df = pd.concat(feature_df_chunks, ignore_index=True)
+            
+            # Clean up chunks immediately after concat
+            del feature_df_chunks
+            post_concat_memory = get_memory_usage()
+            objects_freed = force_cleanup()
+            final_memory = get_memory_usage()
+            
+            self.logger.info(f"💾 Memory during concat: {pre_concat_memory:.1f}MB → {post_concat_memory:.1f}MB → {final_memory:.1f}MB")
+            self.logger.info(f"🧹 Objects freed after concat: {objects_freed}")
+            
+            # Feature summary using stored original columns
             new_cols = set(feature_df.columns) - original_cols
             
             self.stats['features_created'] = len(new_cols)
@@ -900,7 +1015,18 @@ class EagleFordFeatureEngineer:
             
             # Create train/validation/test splits based on feature-engineered data
             self.logger.info("Creating train/validation/test splits...")
-            splits = self.create_train_test_splits(feature_df)
+            
+            # Get split ratios from config
+            test_size = getattr(self.config, 'test_size', 0.2)
+            validation_size = getattr(self.config, 'validation_size', 0.2)
+            train_size = 1.0 - test_size - validation_size
+            
+            self.logger.debug(f"📊 Config split ratios: train={train_size}, val={validation_size}, test={test_size}")
+            
+            splits = self.create_train_test_splits(feature_df, 
+                                                 train_ratio=train_size,
+                                                 val_ratio=validation_size, 
+                                                 test_ratio=test_size)
             
             # Save split information
             splits_path = self.output_dir / "train_test_splits.json"
@@ -925,9 +1051,13 @@ class EagleFordFeatureEngineer:
             # Store split info in stats
             self.stats['splits'] = splits['statistics']
             
-            # Create normalized versions for different model types
+            # Create normalized versions for different model types with memory optimization
+            self.logger.info("Creating normalized datasets with memory management...")
             
             # 1. Standard normalization for neural networks
+            norm_memory_before = get_memory_usage()
+            self.logger.info(f"💾 Memory before normalization: {norm_memory_before:.1f}MB")
+            
             df_standard, scaler_standard = self.normalize_features(feature_df, 'standard')
             standard_path = self.output_dir / "master_dataset_features_normalized_standard.csv"
             df_standard.to_csv(standard_path, index=False)
@@ -936,8 +1066,14 @@ class EagleFordFeatureEngineer:
             scaler_path = self.output_dir / "feature_scaler_standard.pkl"
             with open(scaler_path, 'wb') as f:
                 pickle.dump(scaler_standard, f)
+            
+            # Clean up standard dataframe immediately
+            del df_standard, scaler_standard
+            standard_cleanup = force_cleanup()
+            standard_memory = get_memory_usage()
+            self.logger.info(f"🧹 After standard normalization cleanup: {standard_cleanup} objects freed, memory: {standard_memory:.1f}MB")
                 
-            # 2. MinMax normalization for some ML algorithms
+            # 2. MinMax normalization for some ML algorithms  
             df_minmax, scaler_minmax = self.normalize_features(feature_df, 'minmax')
             minmax_path = self.output_dir / "master_dataset_features_normalized_minmax.csv"
             df_minmax.to_csv(minmax_path, index=False)
@@ -946,8 +1082,14 @@ class EagleFordFeatureEngineer:
             scaler_minmax_path = self.output_dir / "feature_scaler_minmax.pkl"
             with open(scaler_minmax_path, 'wb') as f:
                 pickle.dump(scaler_minmax, f)
+            
+            # Clean up minmax dataframe immediately
+            del df_minmax, scaler_minmax
+            minmax_cleanup = force_cleanup()
+            final_norm_memory = get_memory_usage()
+            self.logger.info(f"🧹 After minmax normalization cleanup: {minmax_cleanup} objects freed, memory: {final_norm_memory:.1f}MB")
                 
-            self.logger.info("Created normalized datasets for different model types")
+            self.logger.info("✅ Created normalized datasets with memory optimization")
             
             # Create sequence data for LSTM
             if self.config.get('sequence_features'):

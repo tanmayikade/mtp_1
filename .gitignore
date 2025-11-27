@@ -9,6 +9,8 @@ lerna-debug.log*
 
 # CSV files
 *.csv
+dataset/raw
+dataset/test
 
 # JSON files (excluding package.json and other config files)
 data/*.json
@@ -103,3 +105,6 @@ htmlcov/
 *.model
 *.h5
 *.joblib
+
+# Test outputs
+test_output
